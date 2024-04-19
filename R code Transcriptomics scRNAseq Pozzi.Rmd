@@ -1,0 +1,449 @@
+---
+title: "Transcriptomics Exam: Single Cell Analysis"
+author: "Camilla Pozzi"
+date: '2022-07-10'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, results= 'hide'}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(Seurat)
+library(devtools)
+```
+
+## Loading the data
+The data were taken from [PANGLAODB](https://panglaodb.se/view_data.php?sra=SRA850958&srs=SRS4386112). 
+The sample is from the spleen of a mouse. 
+
+note: sp stands for spleen
+```{r}
+load("SRA653146_SRS3044250.sparse.RData")
+rownames(sm) <- sapply(strsplit(rownames(sm),"_"), `[`, 1)
+sp.data <- sm 
+
+sp <- CreateSeuratObject(counts = sp.data, project = "snsc", min.cells = 3, min.features = 200)
+```
+
+## Cell quality control
+
+Checking for the presence of mitochondrial genes (mt-…)
+```{r}
+grep("^mt-",rownames(sp),value = TRUE)
+
+sp[["percent.mt"]] <- PercentageFeatureSet(sp, pattern = "^mt-")
+```
+
+and ribosomial protein genes (Rp|ls…)
+```{r, results = 'hide'}
+grep("^Rp[ls]",rownames(sp),value = TRUE)
+ 
+sp[["percent.rbp"]] <- PercentageFeatureSet(sp, pattern = "^Rp[ls]")
+```
+
+## Visualizethe  QC metrics as violin plots 
+
+The number of unique genes, called features, and of total molecules are automatically created during the CreateSeuratObject. 
+```{r}
+VlnPlot(sp, features = c("nFeature_RNA", "nCount_RNA", "percent.mt","percent.rbp"), ncol = 4)
+```
+
+Same plot but without dots. 
+```{r}
+VlnPlot(sp, features = c("nFeature_RNA", "nCount_RNA", "percent.mt","percent.rbp"), ncol = 4, pt.size=0)
+```
+
+We can check if the different parameters are correlated with one another by using the FeatureScatter plots:
+• Correlation between % of mitochondrial RNA and number of reads \n 
+• Correlation between number of genes and number of reads \n
+• Correlation between % of rRNA and number of reads \n
+
+```{r}
+FeatureScatter(sp, feature1 = "nCount_RNA", feature2 = "percent.mt")
+FeatureScatter(sp, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+FeatureScatter(sp, feature1 = "nCount_RNA", feature2 = "percent.rbp")
+```
+
+
+Defining a thresholds for cell quality control
+In this case the number of genes must be between 200 and 3500 and the mitochondrial DNA/RNA percentage must be lower than 5%. 
+```{r}
+sp 
+sp <- subset(sp, subset = nFeature_RNA > 200 & nFeature_RNA < 3500 & percent.mt < 5)
+sp
+```
+
+## Data Normalization
+```{r}
+sp <- NormalizeData(sp, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+## Cell cycle effect
+
+```{r, results='hide'}
+convertHumanGeneList <- function(x){
+  require("biomaRt")
+  human = useMart(biomart="ensembl", dataset = "hsapiens_gene_ensembl", verbose = TRUE, host = "https://dec2021.archive.ensembl.org")
+  mouse = useMart(biomart="ensembl", dataset = "mmusculus_gene_ensembl", verbose = TRUE, host = "https://dec2021.archive.ensembl.org")
+  genes = getLDS(attributes = c("hgnc_symbol"), filters = "hgnc_symbol", values = x , mart = human, attributesL = c("mgi_symbol"), martL = mouse, uniqueRows=T)
+  
+  humanx <- unique(genes[, 2])
+  return(humanx)
+}
+m.s.genes <- convertHumanGeneList(cc.genes.updated.2019$s.genes)
+m.g2m.genes <- convertHumanGeneList(cc.genes.updated.2019$g2m.genes)
+
+CellCycleScoring(sp, s.features = m.s.genes, g2m.features = m.g2m.genes, set.ident = TRUE) -> sp
+```
+
+Keeping only the 2000 most variable genes, because we keep a subset of genes with the greatest variability of expression across all the cells.
+```{r}
+sp <- FindVariableFeatures(sp, selection.method = "vst", nfeatures = 2000)
+
+top10 <- head(VariableFeatures(sp), 10)
+
+plot1 <- VariableFeaturePlot(sp)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+```
+```{r}
+plot2
+```
+
+## Scaling the data
+We shift the expression of each gene so that the mean is 0 and the variance is 1 across cells. 
+```{r}
+all.genes <- rownames(sp)
+sp <- ScaleData(sp, features = all.genes)
+```
+
+## Dimensionality reduction
+We perform PCA on the 2000 most variable genes. 
+```{r}
+sp <- RunPCA(sp, features = VariableFeatures(object = sp))
+print(sp[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(sp, dims = 1:2, reduction = "pca")
+VizDimLoadings(sp, dims = 3:4, reduction = "pca")
+VizDimLoadings(sp, dims = 4:5, reduction = "pca")
+```
+
+We want to visualize the  cells using the first two Principal Components (PCs). We project the cells in the first two principal components, the cells are colored according to their cell cycle phase. 
+```{r}
+DimPlot(sp, reduction = "pca")
+```
+
+## Selecting the number of PCs
+
+With ndims we can choose how many PCs to plot. 
+```{r}
+ElbowPlot(sp, ndims= 30)
+```
+
+Choosing how many dimensions to use can vary depending on the method we choose. In general it's better to keep all PC until 70/75% of the variance is explained. 
+
+```{r}
+pc.touse <- (sp$pca@stdev)^2
+pc.touse <- pc.touse/sum(pc.touse)
+pc.touse <- cumsum(pc.touse)[1:50]
+pc.touse <- min(which(pc.touse>=0.85))
+pc.touse
+```
+
+In our case we opted for 15 PCs (standard deviation lower than 2) components and 27 PCs (at least 80% of the variance is explained). 
+
+## Clustering with 15 PCs
+The first step uses the FindNeighbors function, which constructs a KNN graph based on the euclidean distance in PCA space and refines the edge weights using the Jaccard similarity. 
+```{r}
+sp.15 <- FindNeighbors(sp, dims = 1:15)
+```
+
+To cluster the cell we use the FindClusters function, which uses the Louvain algorithm to iteratively group cells together
+```{r}
+sp.15<- FindClusters(sp.15, resolution = 0.2)
+```
+
+## T Stochastic Neighbor Embedding (TSNE)
+We plot the clusters using TSNE.
+```{r}
+sp.15.tsne <- RunTSNE(sp.15, dims=1:15)
+DimPlot(sp.15.tsne, reduction = "tsne")
+```
+## Uniform Manifold Approximation and Projection(UMAP) 
+
+This method is generally preferred. 
+```{r}
+sp.15.UMAP <- RunUMAP(sp.15, dims = 1:15)
+DimPlot(sp.15.UMAP, reduction = "umap")
+```
+
+We can also check whether some of the critical quality parameters or the cell cycle influenced the clustering we got. 
+```{r}
+VlnPlot(sp.15.UMAP,features="nCount_RNA")
+VlnPlot(sp.15.UMAP,features="nFeature_RNA")
+VlnPlot(sp.15.UMAP,features="percent.mt")
+VlnPlot(sp.15.UMAP,features="percent.rbp")
+```
+```{r}
+library(ggplot2)
+library(dbplyr)
+
+sp.15@meta.data %>%
+  group_by(seurat_clusters,Phase) %>%
+  count()  %>% 
+  group_by(seurat_clusters) %>%
+  mutate(percent=100*n/sum(n)) %>%
+  ungroup() %>%
+  ggplot(aes(x=seurat_clusters,y=percent, fill=Phase)) +
+  geom_col() + 
+  ggtitle("Percentage of cell cycle phases per cluster")
+```
+In clustering 4 and 5 there seems to be a higher value of mithocondrial RNA, but the quality check for the clustering seems reasonable. 
+
+## Clustering with 27 PCs
+
+We repeat the analysis for 27 PCs.
+```{r}
+sp.27 <- FindNeighbors(sp, dims = 1:27)
+```
+
+To cluster the cell we use the FindClusters function, which uses the Louvain algorithm to iteratively group cells together.
+```{r}
+sp.27 <- FindClusters(sp.27, resolution =0.3)
+```
+## T Stochastic Neighbor Embedding (TSNE)
+
+ We plot the clusters using TSNE.
+```{r}
+sp.27.tsne <- RunTSNE(sp.27, dims=1:27)
+DimPlot(sp.27.tsne, reduction = "tsne")
+```
+## Uniform Manifold Approximation and Projection(UMAP) 
+
+```{r}
+sp.27.UMAP <- RunUMAP(sp.27, dims = 1:27)
+DimPlot(sp.27.UMAP, reduction = "umap")
+```
+
+We can also check whether some of the critical quality parameters.
+```{r}
+VlnPlot(sp.27.UMAP,features="nCount_RNA")
+VlnPlot(sp.27.UMAP,features="nFeature_RNA")
+VlnPlot(sp.27.UMAP,features="percent.mt")
+VlnPlot(sp.27.UMAP,features="percent.rbp")
+```
+```{r}
+sp.27@meta.data %>%
+  group_by(seurat_clusters,Phase) %>%
+  count()  %>% 
+  group_by(seurat_clusters) %>%
+  mutate(percent=100*n/sum(n)) %>%
+  ungroup() %>%
+  ggplot(aes(x=seurat_clusters,y=percent, fill=Phase)) +
+  geom_col() + 
+  ggtitle("Percentage of cell cycle phases per cluster")
+```
+Having a higher resolution leads to a higher number of clusters. 
+
+## Finding marker genes for 15 PCs clustering
+
+Seurat also includes a function that can be used to find genes over expressed between two clusters or over-expressed in one cluster with respect to all the others.
+
+```{r}
+sp.15 <- sp.15.UMAP
+sp.markers <- FindAllMarkers(sp.15, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+sp.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 5, order_by = avg_log2FC)
+
+
+```
+
+## Heatmap
+```{r}
+sp.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+DoHeatmap(sp.15, features = top10$gene) + NoLegend()
+```
+Looking at the Heatmap we can see that clusters 0 and 1 show a lot of similarities.
+Also clusters 2,3 and 6 are similars and 4 and 8.
+
+## Going in depth 
+
+We want to asses the cell type shared by cluster 2, 3 and 6.
+```{r}
+cluster2AND3AND6.markers <- FindMarkers(sp.15, ident.1 = c(2,3,6), min.pct = 0.25, test.use = "wilcox")
+cluster2AND3AND6.markers <- cluster2AND3AND6.markers[order(-cluster2AND3AND6.markers$avg_log2FC), ] 
+head(cluster2AND3AND6.markers, n = 20)
+```
+Tbrc2 = t-receptor beta, t-cell
+Cd3d = CD3 antigen, t-cell
+Cd3g = CD3 antigen, t-cell
+
+They are all T-cells. 
+
+Let's see the genes making the difference between those two clusters:
+We look at the genes over-expressed in cluster 2 vs cluster 3 and 6.
+```{r}
+cluster2vs36.markers <- FindMarkers(sp.15, ident.1 = 2, ident.2 = c(3, 6), min.pct = 0.25, test.use = "wilcox") 
+cluster2vs36.markers <- cluster2vs36.markers[order(-cluster2vs36.markers$avg_log2FC),] 
+head(cluster2vs36.markers, n = 20)
+```
+Cd8b1 = Ig-like domain-containing protein, T-cell
+Ccl5 = C-C motif chemokine 5, natural killer cells
+Cd8a = T-cell surface glycoprotein CD8 alpha chain, T-cell
+Nkg7 = natural killer and T-cells
+
+In cluster 2 we have mainly of T-cells and some natural killer cells. 
+
+And over-expressed in cluster 3 vs cluster 2 and 6. 
+```{r}
+cluster3vs26.markers <- FindMarkers(sp.15, ident.1 = 3, ident.2 = c(2, 6), min.pct = 0.25, test.use = "wilcox") 
+cluster3vs26.markers <- cluster3vs26.markers[order(-cluster3vs26.markers$avg_log2FC),] 
+head(cluster3vs26.markers, n = 20)
+```
+Cd4 = T-cell surface glycoprotein CD4, T-cell
+Igfbp4 = Insulin-like growth factor-binding protein 4, T-cell
+Cd5 = T-cell surface glycoprotein CD5, T-cell
+
+Cluster 3 is composed mainly of T-cells.
+
+And over-expressed in cluster 6 vs cluster 2 and 3.
+```{r}
+cluster6vs23.markers <- FindMarkers(sp.15, ident.1 = 6, ident.2 = c(2, 3), min.pct = 0.25, test.use = "wilcox") 
+cluster6vs23.markers <- cluster6vs23.markers[order(-cluster6vs23.markers$avg_log2FC),] 
+head(cluster6vs23.markers, n = 20)
+```
+Cxcr6 = C-X-C chemokine receptor type 6, T-cells 
+
+Even if in this analysis it might seem that cluster 6 is formed of B-cells, if we look at the most significant genes we can see that they are all T-cells. We can conclude that it's a T-cells cluster. 
+
+As in in cluster 2 and 3 the over-expressed genes in cluster 6 are mainly T-cells. We can conclude that clusters 2, 3 and 6 can be merged together as seen in the HeatMap.
+
+Repeating the analysis also for clusters 1 and 0.
+```{r}
+cluster0AND1.markers <- FindMarkers(sp.15, ident.1 = c(0, 1), min.pct = 0.25, test.use = "wilcox")
+cluster0AND1.markers <- cluster0AND1.markers[order(-cluster0AND1.markers$avg_log2FC), ] 
+head(cluster0AND1.markers, n = 20)
+```
+Ebf1 = Transcription factor COE1, B-cells
+Cd79a = B-cell antigen receptor complex-associated protein alpha chain, B-cells
+Igkc = Immunoglobulin kappa constant, B-cell
+
+And over-expressed in cluster 0 vs cluster 1.
+```{r}
+cluster0vs1.markers <- FindMarkers(sp.15, ident.1 = 0, ident.2 = 1, min.pct = 0.25, test.use = "wilcox") 
+cluster0vs1.markers <- cluster0vs1.markers[order(-cluster0vs1.markers$avg_log2FC),] 
+head(cluster0vs1.markers, n = 20)
+```
+Klf2 = Krueppel-like factor 2, expressed in all the cells
+Cd55 = Complement decay-accelerating factor, GPI-anchored, B-cells
+Ighd = Ig delta chain C region secreted form, B-cells
+Fcer2a = Low affinity immunoglobulin epsilon Fc receptor, B-cell
+
+In cluster 0 we have a lot of B-cells. 
+
+And over-expressed in cluster 1 vs cluster 0.
+```{r}
+cluster1vs0.markers <- FindMarkers(sp.15, ident.1 = 1, ident.2 = 0, min.pct = 0.25, test.use = "wilcox") 
+cluster1vs0.markers <- cluster1vs0.markers[order(-cluster1vs0.markers$avg_log2FC),] 
+head(cluster1vs0.markers, n = 20)
+```
+Plac8 = Placenta-specific gene 8 protein, dentritic cell
+Rgs10 = Regulator of G-protein signaling 10, expressed in all the cells types
+Marcks = Myristoylated alanine-rich C-kinase substrat, macrophage 
+Dtx1 = E3 ubiquitin-protein ligase DTX1, B-cells
+Dnase1l3 = Deoxyribonuclease gamma, macrophage
+Cr2 = Complement receptor type 2, B-cells
+
+In cluster 1 we have mainly B-cells and macrophages, while in cluster 0 we only have B-cells. 
+
+Finally repeating the analysis for clusters 4 and 8.
+```{r}
+cluster4AND8.markers <- FindMarkers(sp.15, ident.1 = c(4, 8), min.pct = 0.25, test.use = "wilcox")
+cluster4AND8.markers <- cluster4AND8.markers[order(-cluster4AND8.markers$avg_log2FC), ] 
+head(cluster4AND8.markers, n = 20)
+```
+Lyz2 = Lysozyme C-2, macrophage
+Cts3 = Cathepsin-3 , expressed in all the gene types
+Slpi = Antileukoproteinase, macrophage and dentritic cells 
+Dnase1l3 = Deoxyribonuclease gamma, macrophage
+
+Genes over-expressed in cluster 4 vs cluster 8.
+```{r}
+cluster4vs8.markers <- FindMarkers(sp.15, ident.1 = 4, ident.2 = 8, min.pct = 0.25, test.use = "wilcox") 
+cluster4vs8.markers <- cluster4vs8.markers[order(-cluster4vs8.markers$avg_log2FC),] 
+head(cluster4vs8.markers, n = 20)
+```
+Dnase1l3 = Deoxyribonuclease gamma, macrophage
+Ccl5 = C-C motif chemokine 5, natural killer cell
+RP23-52N2.1 = ribosomial protein
+Hmox1 = Heme oxygenase 1, macrophage
+Prdx1 = Peroxiredoxin-1, macrophage and dendritic cells
+
+In cluster 4 we have mainly macrophages with some natural killer and dentritic cells.
+
+And over-expressed in cluster 8 vs cluster 4.
+```{r}
+cluster8vs4.markers <- FindMarkers(sp.15, ident.1 = 8, ident.2 = 4, min.pct = 0.25, test.use = "wilcox") 
+cluster8vs4.markers <- cluster8vs4.markers[order(-cluster8vs4.markers$avg_log2FC),] 
+head(cluster8vs4.markers, n = 20)
+```
+Retnlg = Resistin-like gamma, macrophage
+S100a8 and S100a9 = calcium binding protein, macrophage
+Il1b = Interleukin-1 beta, macrophage
+Csf3r = Granulocyte colony-stimulating factor receptor, macrophage
+
+Cluster 4 and 8 are both made of macrophages, so they can be merged into one single cluster.
+
+Cluster 7 is made of natural killer cells --> Gzma (Granzyme A) is a natural killer cell. 
+Cluster 5 is made of detritic cells --> Plac8 (Placenta-specific gene 8 protein) is a dentritc cell. 
+
+## Visualizing marker genes
+
+We can plot the expression of the markers with a heatmap.
+```{r}
+for (feature in c("Cd55", "Cr2", "Cd8b1", "Trbc2", "Lyz2", "Plac8", "Cxcr6", "Gzma", 'Il1b')){
+  p <- FeaturePlot(sp.15, features = feature, repel = T) 
+  plot(p)
+}
+```
+
+Or with a violin plot
+```{r}
+VlnPlot(sp.15, features = "Cd55")
+VlnPlot(sp.15, features = "Cr2")
+VlnPlot(sp.15, features = "Cd8b1")
+VlnPlot(sp.15, features = "Trbc2")
+VlnPlot(sp.15, features = "Lyz2")
+VlnPlot(sp.15, features = "Plac8")
+VlnPlot(sp.15, features = "Cxcr6")
+VlnPlot(sp.15, features = "Gzma")
+VlnPlot(sp.15, features = "Il1b")
+```
+
+We can visualize all the marker genes and their expression (CPM) in each cluster using a dot plot. 
+```{r}
+library(ggrepel)
+DotPlot(sp.15, features = c("Cd55", "Cr2", "Cd8b1", "Trbc2", "Lyz2", "Plac8", "Cxcr6", "Gzma", 'Il1b')) + theme(axis.text.x = element_text(angle = 90))
+```
+
+## Final Results
+
+Using marker genes to infere the subtypes of each cluster was quite difficult and needed a deep knowledge of the field. Eventually we were able to identify 5 different cell types. 
+
+Comparing the results with the automated pipeline employed by Panglao, we were able to label and cluster the cells with unknown cell type as macrophages.
+
+```{r}
+new.cluster.ids <- c("B-cells" ,"B-cells", "T-cells","T-cells", "Macrophage", "Dentritic cells","T-cells", "Natural killer cells", "Macrophage") 
+names(new.cluster.ids) <- levels(sp.15) 
+sp.15 <- RenameIdents(sp.15, new.cluster.ids) 
+DimPlot(sp.15, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+
+```
+
+
